@@ -1,3 +1,5 @@
+<img src="logo.svg" width="64" alt="ZenMux">
+
 # @magpie-community/opencode-zenmux-auth
 
 Uses a [ZenMux Builder Plan](https://zenmux.ai/docs/guide/subscription.html)
