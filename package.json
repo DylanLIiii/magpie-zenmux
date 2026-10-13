@@ -1,0 +1,23 @@
+{
+  "name": "magpie-zenmux-plan",
+  "version": "0.1.0",
+  "description": "ZenMux Builder Plan subscriptions (Starter, Max, Ultra) in OpenCode and magpie",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "zenmux"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DylanLIiii/magpie-zenmux.git"
+  }
+}
