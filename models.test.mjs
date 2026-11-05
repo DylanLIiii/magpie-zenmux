@@ -13,8 +13,10 @@ afterEach(() => {
 
 test("the loader sends the plan's key to the API", async () => {
   const hooks = await ZenMuxPlanAuthPlugin({ client: {} })
-  expect(await hooks.auth.loader(async () => ({ type: "api", key: "sk-ss-v1-plan", metadata: { managementKey: "sk-mg-v1-x" } })))
-    .toEqual({ baseURL: "https://zenmux.ai/api/v1", apiKey: "sk-ss-v1-plan" })
+  const out = await hooks.auth.loader(async () => ({ type: "api", key: "sk-ss-v1-plan", metadata: { managementKey: "sk-mg-v1-x" } }))
+  expect(out.baseURL).toBe("https://zenmux.ai/api/v1")
+  expect(out.apiKey).toBe("sk-ss-v1-plan")
+  expect(typeof out.fetch).toBe("function")
   expect(await hooks.auth.loader(async () => undefined)).toEqual({})
 })
 

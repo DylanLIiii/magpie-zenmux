@@ -125,6 +125,236 @@ function usageOf(d) {
   }
 }
 
+// Magpie asks the next member of a routing group for a 400 or 422 only when
+// the body is a shape it knows (shapeWords: unknown_parameter among them),
+// and that member doesn't rest. Anything else in those statuses is the
+// request's own fault and stops the group. ZenMux's 400 invalid_params and
+// 422 provider_unprocessable_entity_error are often an upstream's refusal
+// of one field — a call_id longer than that vendor allows — worded so
+// Magpie doesn't know it, and a long thread is then read as the prompt
+// overflowing ("too long") and never retried. Said back as
+// unknown_parameter, the next member is asked.
+//
+// Left as they arrived: statuses Magpie already retries, a prompt that
+// really is too long, quota and credit, and ZenMux's own checks (a missing
+// parameter, an unknown model, a bare "field required").
+const shapeWords = /failed to deserialize|unknown (?:item |content |input )?(?:type|variant|field|parameter)|unknown_parameter|unrecognized (?:request argument|field|parameter)|extra (?:inputs|fields) are not permitted|additional properties are not allowed|schema exceeds the maximum (?:nesting )?depth|schema[^"]{0,60}\bnesting depth\b|function_declarations\[\d+\]\.parameters\b/i
+const tooLongRe = /context_length_exceeded|prompt is too long|input is too long|(?:exceeds?|exceeded|over|beyond)(?: the)?(?: model'?s?)?(?: maximum)? context|context (?:length|limit|window) (?:exceeded|is exceeded)|context (?:window )?(?:is )?full\b|maximum context length|too many (?:input |prompt )?tokens|上下文(?:长度)?(?:超|过长)|超(?:过|出)(?:了)?(?:模型)?(?:的)?(?:最大)?上下文|input token count.*exceeds the maximum|maximum prompt length is \d|reduce the length of the messages|maximum allowed input length|longer than the model'?s context length|available context size|greater than the context length|prompt token count of [\d,]+ exceeds the limit|context window exceeds limit|exceeded model token limit|configured context size|prompt too long|prompt exceeds max length|context_window_exceeded|exceeded (?:max |maximum )?context length|range of input length should be|token limit exceeded|input tokens? (?:count )?(?:exceeds?|exceeded) (?:the )?(?:max(?:imum)? )?limit|(?:内容|输入|文本|提示词?|prompt|问题|对话|消息)(?:内容|文本)?(?:长度)?\s*(?:太长|过长|超长)|字数(?:太多|过多)|(?:内容|输入|文本|提示词?|prompt|问题|对话|消息)[^，。,.;；!！]{0,12}超(?:过|出)[^，。,.;；!！]{0,12}(?:长度|token|令牌|字数)|(?:输入|提示词?|prompt)\s*的?\s*(?:长度|token|令牌|字数)[^，。,.;；!！]{0,8}超(?:过|出)/i
+const quotaWords = /quota|insufficient|balance|credit|billing|out of budget|budget (?:exceeded|exhausted)|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|频繁|速率|套餐|用量|上限/i
+const creditWords = /insufficient.?(?:balance|credit|fund)|balance|credit|billing|payment|arrear|overdue|suspended|余额|欠费|充值|账户.*(?:不足|停)/i
+const unservedWords = /model.{0,80}(?:not (?:supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid)|(?:no such|unknown|invalid|unsupported) model|model_not_found|has no provider supported|deployment[ _]?not[ _]?found|deployment.{0,60}does ?n[o']t exist|模型.{0,12}(?:不存在|不支持|无权|未开通)/i
+const refusedWords = /unapproved channel|illegal api invocation/i
+const regionWords = /\buser location is not supported for the api use\b|unsupported_country_region_territory|country, region,? or territory not supported/i
+// ZenMux's own validation, before an upstream sees the request
+const platformCheck = /parameter\s+\S+\s+is required|model\s+\S+\s+is not valid|field required/i
+// an upstream's field, as OpenAI words it, often with the vendor's request id
+const upstreamField = /invalid\s+['"][^'"]+['"]|expected a string with maximum length|string too (?:long|large|big)|\(\s*request_id\s*:/i
+
+const magpieRetries = (status) => status === 401 || status === 402 || status === 403 || status === 404 || status === 408 || status === 413 || status === 429 || status >= 500
+
+function asText(body) {
+  if (typeof body === "string") return body
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body)
+  if (body && typeof body === "object") return JSON.stringify(body)
+  return body == null ? "" : String(body)
+}
+
+function readMessage(text) {
+  try {
+    const v = JSON.parse(text)
+    const e = v?.error
+    if (typeof e === "string" && e.trim()) return e
+    if (e && typeof e === "object" && typeof e.message === "string") return e.message
+    if (typeof v?.message === "string") return v.message
+  } catch {
+    // not JSON: the body itself is the message
+  }
+  return text.trim()
+}
+
+// "too long" on a field is not the prompt overflowing. Left in, a thread
+// past half the window is told to compact and the next member is never asked.
+function soften(message) {
+  return message.replace(/\btoo long\b/gi, "over the limit").replace(/\btoo large\b/gi, "over the limit").replace(/\btoo big\b/gi, "over the limit")
+}
+
+// providerError is a ZenMux answer rewritten so Magpie falls back on it, or
+// null when the answer should reach Magpie unchanged. status is 400 or 422.
+function providerError(status, body) {
+  if (status !== 400 && status !== 422) return null
+  const text = asText(body)
+  const message = readMessage(text)
+  const hay = text + "\n" + message
+  if (shapeWords.test(hay) || tooLongRe.test(hay) || quotaWords.test(hay) || creditWords.test(hay) || unservedWords.test(hay) || refusedWords.test(hay) || regionWords.test(hay) || platformCheck.test(hay)) return null
+  const upstream = status === 422 && /provider_unprocessable_entity_error/i.test(hay)
+  if (!upstream && !upstreamField.test(hay)) return null
+  const said = soften(message).trim() || "the upstream provider rejected the request"
+  return {
+    status,
+    body: JSON.stringify({ error: { message: said, type: "invalid_request_error", code: "unknown_parameter" } }),
+  }
+}
+
+function carry(res, text) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  return new Response(text, { status: res.status, statusText: res.statusText, headers })
+}
+
+function jsonResponse(next) {
+  return new Response(next.body, { status: next.status, headers: { "content-type": "application/json" } })
+}
+
+// sseEvents splits one buffer into complete events. rest is the unfinished tail.
+function sseEvents(buffer, flush) {
+  const norm = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+  const parts = norm.split("\n\n")
+  const rest = flush ? "" : (parts.pop() ?? "")
+  const events = []
+  for (const part of parts) {
+    if (!part.trim()) continue
+    const data = []
+    for (const line of part.split("\n")) {
+      if (!line || line.startsWith(":")) continue
+      const i = line.indexOf(":")
+      if (i < 0) continue
+      if (line.slice(0, i) !== "data") continue
+      let value = line.slice(i + 1)
+      if (value.startsWith(" ")) value = value.slice(1)
+      data.push(value)
+    }
+    if (data.length) events.push(data.join("\n"))
+  }
+  return { events, rest }
+}
+
+function textOf(v) {
+  if (typeof v === "string") return v
+  if (Array.isArray(v)) return v.map(textOf).join("")
+  if (v && typeof v === "object" && typeof v.text === "string") return v.text
+  return ""
+}
+
+// hasContent says an event already carried part of the reply, so the stream
+// can no longer be turned into a clean refusal the next member could answer.
+function hasContent(j) {
+  if (!j || typeof j !== "object") return false
+  const choices = j.choices
+  if (Array.isArray(choices)) {
+    for (const c of choices) {
+      const d = c?.delta ?? c?.message ?? {}
+      if (textOf(d.content) || textOf(d.reasoning_content) || textOf(d.reasoning) || textOf(d.refusal) || textOf(c?.text)) return true
+      if (Array.isArray(d.tool_calls) && d.tool_calls.length) return true
+    }
+  }
+  if (typeof j.delta === "string" && j.delta) return true
+  if (typeof j.type === "string" && /content_block_delta|output_text/.test(j.type)) return true
+  return false
+}
+
+function isErrorEvent(j) {
+  if (!j || typeof j !== "object" || Array.isArray(j)) return false
+  if (j.choices) return false
+  if (j.error != null && j.error !== false) return true
+  if (j.type === "error") return true
+  return typeof j.message === "string" && (j.type != null || j.code != null)
+}
+
+function eventStatus(j) {
+  const blob = typeof j === "string" ? j : JSON.stringify(j)
+  if (/provider_unprocessable_entity_error/i.test(blob)) return 422
+  return 400
+}
+
+function replay(res, chunks, reader) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  const stream = new ReadableStream({
+    async pull(controller) {
+      if (chunks.length) {
+        controller.enqueue(chunks.shift())
+        return
+      }
+      const { done, value } = await reader.read()
+      if (done) controller.close()
+      else controller.enqueue(value)
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+  return new Response(stream, { status: res.status, statusText: res.statusText, headers })
+}
+
+// answerStream turns an event stream that failed before any reply into the
+// same JSON a 400 or 422 would be. : ZENMUX PROCESSING is a keep-alive, not
+// an event. Once a content delta has passed, the stream goes on unchanged.
+async function answerStream(res) {
+  if (!res.body) return res
+  const reader = res.body.getReader()
+  const dec = new TextDecoder()
+  const chunks = []
+  let tail = ""
+  let errorEvent = null
+  const consider = (flush) => {
+    const parsed = sseEvents(tail, flush)
+    tail = parsed.rest
+    let sawContent = false
+    for (const data of parsed.events) {
+      if (!data || data === "[DONE]") continue
+      let json
+      try {
+        json = JSON.parse(data)
+      } catch {
+        if (providerError(400, data) || providerError(422, data)) errorEvent = data
+        else sawContent = true
+        continue
+      }
+      if (hasContent(json)) sawContent = true
+      else if (isErrorEvent(json)) errorEvent = json
+    }
+    return sawContent
+  }
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (value) {
+        chunks.push(value)
+        tail += dec.decode(value, { stream: true })
+      }
+      if (done) tail += dec.decode()
+      if (consider(done)) return replay(res, chunks, reader)
+      if (errorEvent) {
+        const next = providerError(eventStatus(errorEvent), typeof errorEvent === "string" ? errorEvent : JSON.stringify(errorEvent))
+        if (next) {
+          await reader.cancel().catch(() => {})
+          return jsonResponse(next)
+        }
+        return replay(res, chunks, reader)
+      }
+      if (done) break
+    }
+  } catch (e) {
+    await reader.cancel().catch(() => {})
+    throw e
+  }
+  return replay(res, chunks, reader)
+}
+
+// answer is the loader's fetch: ZenMux's reply, with an upstream refusal
+// Magpie would not fall back from rewritten into one it does.
+async function answer(res) {
+  if (magpieRetries(res.status)) return res
+  if (/text\/event-stream/i.test(res.headers.get("content-type") ?? "")) return answerStream(res)
+  if (res.status !== 400 && res.status !== 422) return res
+  const text = await res.text()
+  const next = providerError(res.status, text)
+  if (!next) return carry(res, text)
+  return jsonResponse(next)
+}
+
 async function subscriptionDetail(key) {
   const res = await fetch(SITE.api + "/management/subscription/detail", {
     headers: { Authorization: "Bearer " + key, Accept: "application/json" },
@@ -176,7 +406,16 @@ export async function ZenMuxPlanAuthPlugin() {
       async loader(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return {}
-        return { baseURL: SITE.api, apiKey: auth.key }
+        return {
+          baseURL: SITE.api,
+          apiKey: auth.key,
+          // apiKey is applied before this runs. A refusal Magpie doesn't
+          // know is rewritten; everything else, including a reply that has
+          // already started, is ZenMux's own.
+          async fetch(input, init) {
+            return answer(await globalThis.fetch(input, init))
+          },
+        }
       },
       // the plan, its end and its 5-hour and 7-day windows; the window
       // resets a plan gets each month aren't told by the API, so aren't shown
@@ -212,4 +451,4 @@ export async function ZenMuxPlanAuthPlugin() {
 }
 
 // for tests
-export const _internal = { ID, SITE, MODELS, parseModels, usageOf, windowOf, managementKey }
+export const _internal = { ID, SITE, MODELS, parseModels, usageOf, windowOf, managementKey, providerError }
