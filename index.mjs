@@ -441,7 +441,6 @@ export async function ZenMuxPlanAuthPlugin() {
               key: "managementKey",
               message: "ZenMux Management API key (sk-mg-v1-…), to read the plan's quota and resets; leave empty to skip",
               placeholder: "sk-mg-v1-…",
-              validate: (v) => (!v || /^sk-mg-/.test(v.trim()) ? undefined : "a Management API key starts with sk-mg-"),
             },
           ],
         },

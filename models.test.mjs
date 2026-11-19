@@ -25,9 +25,8 @@ test("one api method that asks for the Management key", async () => {
   const [m] = hooks.auth.methods
   expect(m.type).toBe("api")
   expect(m.prompts[0].key).toBe("managementKey")
-  expect(m.prompts[0].validate("")).toBeUndefined()
-  expect(m.prompts[0].validate("sk-mg-v1-abc")).toBeUndefined()
-  expect(m.prompts[0].validate("sk-ss-v1-abc")).toContain("sk-mg-")
+  // any key is taken as given: the prompt has no format check
+  expect(m.prompts[0].validate).toBeUndefined()
 })
 
 test("the live list keeps text models", async () => {
